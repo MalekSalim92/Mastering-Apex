@@ -69,40 +69,54 @@ jobs:
             exit 1
           fi
           
-          TEST_CLASSES=$(cat .github/tests/test-classes.txt | grep -v '^$' | sort -u | awk '{printf "--tests %s ", $0}')
+          TEST_CLASSES=$(cat .github/tests/test-classes.txt | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//')
           echo "test_classes=$TEST_CLASSES" >> $GITHUB_OUTPUT
-          echo "📋 Tests to run (count: $(cat .github/tests/test-classes.txt | grep -v '^$' | sort -u | wc -l))"
+          echo "📋 Tests to run: $TEST_CLASSES"
+          echo "📋 Test count: $(cat .github/tests/test-classes.txt | grep -v '^$' | sort -u | wc -l)"
 
-      - name: Deploy to QA
+      - name: Deploy to QA (without running tests during deployment)
         run: |
           # If this is the first deployment, deploy everything
           if [ "$FIRST_DEPLOY" = "true" ]; then
             echo "🚀 First QA deployment - deploying all metadata from force-app..."
-            sf project deploy start --target-org qaOrg --source-dir force-app --wait 30 ${{ steps.read-tests.outputs.test_classes }}
+            sf project deploy start --target-org qaOrg --source-dir force-app --wait 30 --test-level NoTestRun
             exit 0
           fi
           
           # Otherwise deploy delta
           if [ ! -f package/package.xml ]; then
             echo "⚠️ No metadata changes to deploy, skipping deployment..."
+            echo "SKIP_TESTS=true" >> $GITHUB_ENV
             exit 0
           fi
           
           # Check if package.xml has any actual components
           if ! grep -q "<types>" package/package.xml; then
             echo "⚠️ Package.xml is empty, no components to deploy, skipping..."
+            echo "SKIP_TESTS=true" >> $GITHUB_ENV
             exit 0
           fi
           
           echo "🚀 Deploying only changed metadata to QA..."
-          sf project deploy start --target-org qaOrg --manifest package/package.xml --wait 30 ${{ steps.read-tests.outputs.test_classes }}
+          sf project deploy start --target-org qaOrg --manifest package/package.xml --wait 30 --test-level NoTestRun
 
-      - name: Run tests WITH coverage (validation)
+      - name: Run specified tests WITH coverage
+        if: env.SKIP_TESTS != 'true'
         id: run-coverage
         run: |
-          echo "🧪 Running tests with code coverage..."
+          echo "🧪 Running specified tests with code coverage..."
+          
+          # Build test arguments
+          TEST_ARGS=""
+          IFS=',' read -ra TESTS <<< "${{ steps.read-tests.outputs.test_classes }}"
+          for test in "${TESTS[@]}"; do
+            TEST_ARGS="$TEST_ARGS --tests $test"
+          done
+          
+          echo "Test arguments: $TEST_ARGS"
+          
           sf apex run test --target-org qaOrg \
-            ${{ steps.read-tests.outputs.test_classes }} \
+            $TEST_ARGS \
             --wait 10 \
             --result-format json \
             --code-coverage > test-results.json
@@ -110,8 +124,9 @@ jobs:
           cat test-results.json
 
       - name: Validate code coverage (must be ≥ ${{ vars.COVERAGE_TARGET }}%)
+        if: env.SKIP_TESTS != 'true'
         run: |
-          echo "📊 Checking test run coverage..."
+          echo "📊 Checking test run coverage against target: ${{ vars.COVERAGE_TARGET || 75 }}%"
 
           if [ ! -f test-results.json ]; then
             echo "❌ test-results.json file not found!"
@@ -147,10 +162,11 @@ jobs:
           echo "✅ QA deployment tagged: $QA_TAG"
 
       - name: Deployment Success
-        if: success()
+        if: success() && env.SKIP_TESTS != 'true'
         run: |
           TEST_RUN=$(jq -r '.result.summary.testRunCoverage' test-results.json)
           ORG_WIDE=$(jq -r '.result.summary.orgWideCoverage' test-results.json)
+          THRESHOLD=${{ vars.COVERAGE_TARGET || 75 }}
           echo "✅ QA deployment completed successfully!"
-          echo "📊 Test Run Coverage: $TEST_RUN"
+          echo "📊 Test Run Coverage: $TEST_RUN (Target: ≥${THRESHOLD}%)"
           echo "📊 Org-wide Coverage: $ORG_WIDE"
