@@ -182,46 +182,57 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 10
 
-      - name: Get merged PR info
-        id: pr-info
+      - name: Get branch name from commit history
+        id: branch-info
         run: |
-          # Get the PR that was just merged to main
-          PR_NUMBER=$(gh pr list --state merged --base main --limit 1 --json number --jq '.[0].number')
+          echo "🔍 Searching for branch name in recent commits..."
           
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No merged PR found"
-            echo "HAS_PR=false" >> $GITHUB_OUTPUT
+          # Method 1: Look for merge commit messages from release branch
+          BRANCH_NAME=$(git log -10 --pretty=format:"%s" | grep -oP "Merge branch '\K[^']+(?=' into)" | head -1)
+          
+          if [ -z "$BRANCH_NAME" ]; then
+            # Method 2: Look at the most recent merge from a feature branch
+            BRANCH_NAME=$(git log --merges -10 --pretty=format:"%s" | grep -oP "Merge pull request #\d+ from [^/]+/\K.+" | head -1)
+          fi
+          
+          if [ -z "$BRANCH_NAME" ]; then
+            # Method 3: Check git reflog
+            BRANCH_NAME=$(git reflog show --all -10 --pretty=format:"%gs" | grep -oP "commit \(merge\): merge \K[^ ]+" | sed 's|^origin/||' | grep -v "^main$\|^release$" | head -1)
+          fi
+          
+          if [ -z "$BRANCH_NAME" ]; then
+            echo "❌ Could not find branch name from git history"
+            echo "Recent commit messages:"
+            git log -5 --pretty=format:"%s"
+            echo ""
+            echo "HAS_BRANCH=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # Get the branch name from that PR
-          BRANCH_NAME=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName')
+          # Clean up branch name
+          BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's|^origin/||' | sed 's|^refs/heads/||')
           
-          echo "PR Number: $PR_NUMBER"
-          echo "Branch name: $BRANCH_NAME"
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "✅ Found branch name: $BRANCH_NAME"
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
-          echo "HAS_PR=true" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "HAS_BRANCH=true" >> $GITHUB_OUTPUT
 
       - name: Extract Jira Ticket from Branch Name
-        if: steps.pr-info.outputs.HAS_PR == 'true'
+        if: steps.branch-info.outputs.HAS_BRANCH == 'true'
         id: jira
         run: |
-          BRANCH_NAME="${{ steps.pr-info.outputs.branch_name }}"
-          echo "Branch name: $BRANCH_NAME"
+          BRANCH_NAME="${{ steps.branch-info.outputs.branch_name }}"
+          echo "🎫 Checking branch name: $BRANCH_NAME"
           
-          # Extract ticket number (e.g., HL-328 from HL-328_fix_bug)
+          # Extract ticket number (e.g., HL-6 from HL-6_sample-fix-database-con)
           if [[ $BRANCH_NAME =~ ^([A-Z]+-[0-9]+)_ ]]; then
             TICKET="${BASH_REMATCH[1]}"
-            echo "Found Jira ticket: $TICKET"
+            echo "✅ Found Jira ticket: $TICKET"
             echo "ticket=$TICKET" >> $GITHUB_OUTPUT
             echo "HAS_TICKET=true" >> $GITHUB_OUTPUT
           else
-            echo "No Jira ticket found in branch name"
+            echo "⚠️ No Jira ticket found in branch name: $BRANCH_NAME"
             echo "HAS_TICKET=false" >> $GITHUB_OUTPUT
           fi
 
@@ -233,7 +244,7 @@ jobs:
           JIRA_EMAIL="${{ secrets.JIRA_EMAIL }}"
           JIRA_API_TOKEN="${{ secrets.JIRA_API_TOKEN }}"
           
-          echo "Moving $TICKET to QA status..."
+          echo "🔄 Moving $TICKET to QA status..."
           
           # Get available transitions for the ticket
           TRANSITIONS=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
@@ -264,7 +275,6 @@ jobs:
             echo "✅ Successfully moved $TICKET to QA status"
           else
             echo "Response: $RESPONSE"
-            # Don't fail the workflow if Jira update fails
             echo "⚠️ Jira update may have failed, but continuing..."
           fi
 
@@ -279,7 +289,7 @@ jobs:
           SHORT_SHA="${COMMIT_SHA:0:7}"
           COMMIT_URL="https://github.com/${{ github.repository }}/commit/$COMMIT_SHA"
           
-          COMMENT=$(cat <<EOF
+          COMMENT=$(cat <<'EOF'
           {
             "body": {
               "type": "doc",
@@ -304,12 +314,12 @@ jobs:
                     },
                     {
                       "type": "text",
-                      "text": "$SHORT_SHA",
+                      "text": "SHORT_SHA_PLACEHOLDER",
                       "marks": [
                         {
                           "type": "link",
                           "attrs": {
-                            "href": "$COMMIT_URL"
+                            "href": "COMMIT_URL_PLACEHOLDER"
                           }
                         }
                       ]
@@ -321,15 +331,20 @@ jobs:
                   "content": [
                     {
                       "type": "text",
-                      "text": "Deployed by: ${{ github.actor }}"
+                      "text": "Deployed by: ACTOR_PLACEHOLDER"
                     }
                   ]
                 }
               ]
             }
           }
-          EOF
+EOF
           )
+          
+          # Replace placeholders
+          COMMENT=$(echo "$COMMENT" | sed "s|SHORT_SHA_PLACEHOLDER|$SHORT_SHA|g")
+          COMMENT=$(echo "$COMMENT" | sed "s|COMMIT_URL_PLACEHOLDER|$COMMIT_URL|g")
+          COMMENT=$(echo "$COMMENT" | sed "s|ACTOR_PLACEHOLDER|${{ github.actor }}|g")
           
           curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -X POST \
