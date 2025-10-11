@@ -1,6 +1,6 @@
 public with sharing class PrimitiveDatatype_Example {
     
-    String myString = 'Hello';
+    String myString = 'Hello vvv fdqfsd';
 
     public void printString(){
 
