@@ -180,107 +180,48 @@ jobs:
       - name: Get branch name from commit history
         id: branch-info
         run: |
-          echo "🔍 Searching for branch name in recent commits..."
+          echo "🔍 Searching for feature branch in THIS deployment..."
           
-          BRANCH_NAME=$(git log -10 --pretty=format:"%s" | grep -oP "Merge branch '\K[^']+(?=' into)" | head -1)
+          # Get the previous QA deployment tag to know what's new
+          LAST_QA_TAG=$(git tag -l "qa-deploy-*" | sort -V | tail -n 1)
+          
+          if [ -z "$LAST_QA_TAG" ]; then
+            # First deployment - look at recent commits
+            SEARCH_RANGE="HEAD~10..HEAD"
+          else
+            # Only look at commits since last QA deployment
+            SEARCH_RANGE="${LAST_QA_TAG}..HEAD"
+          fi
+          
+          echo "Searching commits in range: $SEARCH_RANGE"
+          
+          # Find feature branch in this range only
+          BRANCH_NAME=$(git log $SEARCH_RANGE --merges --pretty=format:"%s" | \
+            grep -oP "Merge (pull request #\d+ from [^/]+/|branch ')\K[^'/)]+(?=('| into))" | \
+            grep -v "^release$" | \
+            grep -v "^main$" | \
+            head -1)
           
           if [ -z "$BRANCH_NAME" ]; then
-            BRANCH_NAME=$(git log --merges -10 --pretty=format:"%s" | grep -oP "Merge pull request #\d+ from [^/]+/\K.+" | head -1)
+            # Alternative: search commit messages in this range
+            BRANCH_NAME=$(git log $SEARCH_RANGE --pretty=format:"%s %b" | \
+              grep -oP "\b([A-Z]+-[0-9]+_[a-zA-Z0-9_-]+)\b" | \
+              head -1)
           fi
           
           if [ -z "$BRANCH_NAME" ]; then
-            BRANCH_NAME=$(git reflog show --all -10 --pretty=format:"%gs" | grep -oP "commit \(merge\): merge \K[^ ]+" | sed 's|^origin/||' | grep -v "^main$\|^release$" | head -1)
-          fi
-          
-          if [ -z "$BRANCH_NAME" ]; then
-            echo "❌ Could not find branch name from git history"
-            echo "Recent commit messages:"
-            git log -5 --pretty=format:"%s"
+            echo "❌ Could not find feature branch name from git history"
+            echo ""
+            echo "📋 Commits in this deployment:"
+            git log $SEARCH_RANGE --pretty=format:"%h - %s"
             echo ""
             echo "HAS_BRANCH=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
+          # Clean up branch name
           BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's|^origin/||' | sed 's|^refs/heads/||')
           
-          echo "✅ Found branch name: $BRANCH_NAME"
+          echo "✅ Found feature branch in this deployment: $BRANCH_NAME"
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "HAS_BRANCH=true" >> $GITHUB_OUTPUT
-
-      - name: Extract Jira Ticket from Branch Name
-        if: steps.branch-info.outputs.HAS_BRANCH == 'true'
-        id: jira
-        run: |
-          BRANCH_NAME="${{ steps.branch-info.outputs.branch_name }}"
-          echo "🎫 Checking branch name: $BRANCH_NAME"
-          
-          if [[ $BRANCH_NAME =~ ^([A-Z]+-[0-9]+)_ ]]; then
-            TICKET="${BASH_REMATCH[1]}"
-            echo "✅ Found Jira ticket: $TICKET"
-            echo "ticket=$TICKET" >> $GITHUB_OUTPUT
-            echo "HAS_TICKET=true" >> $GITHUB_OUTPUT
-          else
-            echo "⚠️ No Jira ticket found in branch name: $BRANCH_NAME"
-            echo "HAS_TICKET=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Update Jira Ticket Status
-        if: steps.jira.outputs.HAS_TICKET == 'true'
-        run: |
-          TICKET="${{ steps.jira.outputs.ticket }}"
-          JIRA_URL="${{ secrets.JIRA_URL }}"
-          JIRA_EMAIL="${{ secrets.JIRA_EMAIL }}"
-          JIRA_API_TOKEN="${{ secrets.JIRA_API_TOKEN }}"
-          
-          echo "🔄 Moving $TICKET to QA status..."
-          
-          TRANSITIONS=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-            -X GET \
-            -H "Content-Type: application/json" \
-            "$JIRA_URL/rest/api/3/issue/$TICKET/transitions")
-          
-          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("QA"; "i")) | .id' | head -1)
-          
-          if [ -z "$TRANSITION_ID" ]; then
-            echo "⚠️ Could not find 'QA' transition for ticket $TICKET"
-            echo "Available transitions:"
-            echo "$TRANSITIONS" | jq -r '.transitions[] | "\(.id): \(.name)"'
-            exit 0
-          fi
-          
-          echo "Using transition ID: $TRANSITION_ID"
-          
-          RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -d "{\"transition\":{\"id\":\"$TRANSITION_ID\"}}" \
-            "$JIRA_URL/rest/api/3/issue/$TICKET/transitions")
-          
-          if [ -z "$RESPONSE" ]; then
-            echo "✅ Successfully moved $TICKET to QA status"
-          else
-            echo "Response: $RESPONSE"
-            echo "⚠️ Jira update may have failed, but continuing..."
-          fi
-
-      - name: Add Comment to Jira Ticket
-        if: steps.jira.outputs.HAS_TICKET == 'true'
-        run: |
-          TICKET="${{ steps.jira.outputs.ticket }}"
-          JIRA_URL="${{ secrets.JIRA_URL }}"
-          JIRA_EMAIL="${{ secrets.JIRA_EMAIL }}"
-          JIRA_API_TOKEN="${{ secrets.JIRA_API_TOKEN }}"
-          COMMIT_SHA="${{ github.sha }}"
-          SHORT_SHA="${COMMIT_SHA:0:7}"
-          COMMIT_URL="https://github.com/${{ github.repository }}/commit/$COMMIT_SHA"
-          ACTOR="${{ github.actor }}"
-          
-          COMMENT='{"body":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"✅ Code deployed to QA","marks":[{"type":"strong"}]}]},{"type":"paragraph","content":[{"type":"text","text":"Commit: "},{"type":"text","text":"'"$SHORT_SHA"'","marks":[{"type":"link","attrs":{"href":"'"$COMMIT_URL"'"}}]}]},{"type":"paragraph","content":[{"type":"text","text":"Deployed by: '"$ACTOR"'"}]}]}}'
-          
-          curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -d "$COMMENT" \
-            "$JIRA_URL/rest/api/3/issue/$TICKET/comment"
-          
-          echo "✅ Added comment to $TICKET"
