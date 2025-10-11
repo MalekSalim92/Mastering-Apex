@@ -1,0 +1,156 @@
+name: Deploy to QA on Main Push
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-to-qa:
+    name: Deploy to QA Org
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf version
+
+      - name: Install SFDX Git Delta
+        run: |
+          npm install -g sfdx-git-delta
+          echo "y" | sfdx plugins:install sfdx-git-delta
+
+      - name: Authenticate to QA Org
+        run: |
+          echo "${{ secrets.SF_QA_AUTH_URL }}" > qa-auth.txt
+          sf org login sfdx-url --sfdx-url-file qa-auth.txt --set-default --alias qaOrg
+          sf org display user --target-org qaOrg
+          rm qa-auth.txt
+
+      - name: Generate Delta Package
+        run: |
+          echo "📦 Generating delta package for changed components..."
+          
+          # Check if there's a previous QA deployment tag
+          LAST_QA_TAG=$(git tag -l "qa-deploy-*" | sort -V | tail -n 1)
+          
+          if [ -z "$LAST_QA_TAG" ]; then
+            echo "⚠️ No previous QA deployment tag found"
+            echo "FIRST_DEPLOY=true" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          echo "Last QA deployment: $LAST_QA_TAG"
+          echo "Comparing from $LAST_QA_TAG to HEAD..."
+          
+          sfdx sgd:source:delta --to HEAD --from "$LAST_QA_TAG" --output . --generate-delta --source force-app
+          
+          echo "Changed components:"
+          if [ -f package/package.xml ]; then
+            cat package/package.xml
+          else
+            echo "⚠️ No metadata changes detected"
+          fi
+
+      - name: Read test classes from manifest
+        id: read-tests
+        run: |
+          if [ ! -f ".github/tests/test-classes.txt" ]; then
+            echo "❌ Test manifest not found at .github/tests/test-classes.txt"
+            exit 1
+          fi
+          
+          TEST_CLASSES=$(cat .github/tests/test-classes.txt | grep -v '^$' | sort -u | awk '{printf "--tests %s ", $0}')
+          echo "test_classes=$TEST_CLASSES" >> $GITHUB_OUTPUT
+          echo "📋 Tests to run (count: $(cat .github/tests/test-classes.txt | grep -v '^$' | sort -u | wc -l))"
+
+      - name: Deploy to QA
+        run: |
+          # If this is the first deployment, deploy everything
+          if [ "$FIRST_DEPLOY" = "true" ]; then
+            echo "🚀 First QA deployment - deploying all metadata from force-app..."
+            sf project deploy start --target-org qaOrg --source-dir force-app --wait 30 ${{ steps.read-tests.outputs.test_classes }}
+            exit 0
+          fi
+          
+          # Otherwise deploy delta
+          if [ ! -f package/package.xml ]; then
+            echo "⚠️ No metadata changes to deploy, skipping deployment..."
+            exit 0
+          fi
+          
+          # Check if package.xml has any actual components
+          if ! grep -q "<types>" package/package.xml; then
+            echo "⚠️ Package.xml is empty, no components to deploy, skipping..."
+            exit 0
+          fi
+          
+          echo "🚀 Deploying only changed metadata to QA..."
+          sf project deploy start --target-org qaOrg --manifest package/package.xml --wait 30 ${{ steps.read-tests.outputs.test_classes }}
+
+      - name: Run tests WITH coverage (validation)
+        id: run-coverage
+        run: |
+          echo "🧪 Running tests with code coverage..."
+          sf apex run test --target-org qaOrg \
+            ${{ steps.read-tests.outputs.test_classes }} \
+            --wait 10 \
+            --result-format json \
+            --code-coverage > test-results.json
+          
+          cat test-results.json
+
+      - name: Validate code coverage (must be ≥ ${{ vars.COVERAGE_TARGET }}%)
+        run: |
+          echo "📊 Checking test run coverage..."
+
+          if [ ! -f test-results.json ]; then
+            echo "❌ test-results.json file not found!"
+            exit 1
+          fi
+
+          # Extract test run coverage
+          TEST_RUN=$(jq -r '.result.summary.testRunCoverage' test-results.json)
+          ORG_WIDE=$(jq -r '.result.summary.orgWideCoverage' test-results.json)
+
+          echo "🧪 Test run coverage: $TEST_RUN"
+          echo "🏛️ Org-wide coverage: $ORG_WIDE"
+
+          # Convert TEST_RUN to numeric
+          COVERAGE_NUM=$(echo "$TEST_RUN" | tr -d '%')
+          THRESHOLD=${{ vars.COVERAGE_TARGET || 75 }}
+
+          if (( $(echo "$COVERAGE_NUM < $THRESHOLD" | bc -l) )); then
+            echo "❌ Coverage ($TEST_RUN) is below threshold ($THRESHOLD%)"
+            exit 1
+          else
+            echo "✅ Coverage check passed ($TEST_RUN ≥ $THRESHOLD%)"
+          fi
+
+      - name: Tag Successful Deployment
+        if: success()
+        run: |
+          QA_TAG="qa-deploy-$(date +'%Y%m%d-%H%M%S')"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$QA_TAG"
+          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git "$QA_TAG"
+          echo "✅ QA deployment tagged: $QA_TAG"
+
+      - name: Deployment Success
+        if: success()
+        run: |
+          TEST_RUN=$(jq -r '.result.summary.testRunCoverage' test-results.json)
+          ORG_WIDE=$(jq -r '.result.summary.orgWideCoverage' test-results.json)
+          echo "✅ QA deployment completed successfully!"
+          echo "📊 Test Run Coverage: $TEST_RUN"
+          echo "📊 Org-wide Coverage: $ORG_WIDE"
