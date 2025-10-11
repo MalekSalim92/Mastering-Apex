@@ -41,7 +41,6 @@ jobs:
         run: |
           echo "📦 Generating delta package for changed components..."
           
-          # Check if there's a previous QA deployment tag
           LAST_QA_TAG=$(git tag -l "qa-deploy-*" | sort -V | tail -n 1)
           
           if [ -z "$LAST_QA_TAG" ]; then
@@ -77,21 +76,18 @@ jobs:
 
       - name: Deploy to QA (without running tests during deployment)
         run: |
-          # If this is the first deployment, deploy everything
           if [ "$FIRST_DEPLOY" = "true" ]; then
             echo "🚀 First QA deployment - deploying all metadata from force-app..."
             sf project deploy start --target-org qaOrg --source-dir force-app --wait 30 --test-level NoTestRun
             exit 0
           fi
           
-          # Otherwise deploy delta
           if [ ! -f package/package.xml ]; then
             echo "⚠️ No metadata changes to deploy, skipping deployment..."
             echo "SKIP_TESTS=true" >> $GITHUB_ENV
             exit 0
           fi
           
-          # Check if package.xml has any actual components
           if ! grep -q "<types>" package/package.xml; then
             echo "⚠️ Package.xml is empty, no components to deploy, skipping..."
             echo "SKIP_TESTS=true" >> $GITHUB_ENV
@@ -107,7 +103,6 @@ jobs:
         run: |
           echo "🧪 Running specified tests with code coverage..."
           
-          # Build test arguments
           TEST_ARGS=""
           IFS=',' read -ra TESTS <<< "${{ steps.read-tests.outputs.test_classes }}"
           for test in "${TESTS[@]}"; do
@@ -134,14 +129,12 @@ jobs:
             exit 1
           fi
 
-          # Extract test run coverage
           TEST_RUN=$(jq -r '.result.summary.testRunCoverage' test-results.json)
           ORG_WIDE=$(jq -r '.result.summary.orgWideCoverage' test-results.json)
 
           echo "🧪 Test run coverage: $TEST_RUN"
           echo "🏛️ Org-wide coverage: $ORG_WIDE"
 
-          # Convert TEST_RUN to numeric
           COVERAGE_NUM=$(echo "$TEST_RUN" | tr -d '%')
           THRESHOLD=${{ vars.COVERAGE_TARGET || 75 }}
 
@@ -189,16 +182,13 @@ jobs:
         run: |
           echo "🔍 Searching for branch name in recent commits..."
           
-          # Method 1: Look for merge commit messages from release branch
           BRANCH_NAME=$(git log -10 --pretty=format:"%s" | grep -oP "Merge branch '\K[^']+(?=' into)" | head -1)
           
           if [ -z "$BRANCH_NAME" ]; then
-            # Method 2: Look at the most recent merge from a feature branch
             BRANCH_NAME=$(git log --merges -10 --pretty=format:"%s" | grep -oP "Merge pull request #\d+ from [^/]+/\K.+" | head -1)
           fi
           
           if [ -z "$BRANCH_NAME" ]; then
-            # Method 3: Check git reflog
             BRANCH_NAME=$(git reflog show --all -10 --pretty=format:"%gs" | grep -oP "commit \(merge\): merge \K[^ ]+" | sed 's|^origin/||' | grep -v "^main$\|^release$" | head -1)
           fi
           
@@ -211,7 +201,6 @@ jobs:
             exit 0
           fi
           
-          # Clean up branch name
           BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's|^origin/||' | sed 's|^refs/heads/||')
           
           echo "✅ Found branch name: $BRANCH_NAME"
@@ -225,7 +214,6 @@ jobs:
           BRANCH_NAME="${{ steps.branch-info.outputs.branch_name }}"
           echo "🎫 Checking branch name: $BRANCH_NAME"
           
-          # Extract ticket number (e.g., HL-6 from HL-6_sample-fix-database-con)
           if [[ $BRANCH_NAME =~ ^([A-Z]+-[0-9]+)_ ]]; then
             TICKET="${BASH_REMATCH[1]}"
             echo "✅ Found Jira ticket: $TICKET"
@@ -246,13 +234,11 @@ jobs:
           
           echo "🔄 Moving $TICKET to QA status..."
           
-          # Get available transitions for the ticket
           TRANSITIONS=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -X GET \
             -H "Content-Type: application/json" \
             "$JIRA_URL/rest/api/3/issue/$TICKET/transitions")
           
-          # Find the transition ID for "QA" or "In QA" status
           TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("QA"; "i")) | .id' | head -1)
           
           if [ -z "$TRANSITION_ID" ]; then
@@ -264,7 +250,6 @@ jobs:
           
           echo "Using transition ID: $TRANSITION_ID"
           
-          # Transition the ticket
           RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -X POST \
             -H "Content-Type: application/json" \
@@ -288,63 +273,9 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
           COMMIT_URL="https://github.com/${{ github.repository }}/commit/$COMMIT_SHA"
+          ACTOR="${{ github.actor }}"
           
-          COMMENT=$(cat <<'EOF'
-          {
-            "body": {
-              "type": "doc",
-              "version": 1,
-              "content": [
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "✅ Code deployed to QA",
-                      "marks": [{"type": "strong"}]
-                    }
-                  ]
-                },
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "Commit: "
-                    },
-                    {
-                      "type": "text",
-                      "text": "SHORT_SHA_PLACEHOLDER",
-                      "marks": [
-                        {
-                          "type": "link",
-                          "attrs": {
-                            "href": "COMMIT_URL_PLACEHOLDER"
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                },
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "Deployed by: ACTOR_PLACEHOLDER"
-                    }
-                  ]
-                }
-              ]
-            }
-          }
-EOF
-          )
-          
-          # Replace placeholders
-          COMMENT=$(echo "$COMMENT" | sed "s|SHORT_SHA_PLACEHOLDER|$SHORT_SHA|g")
-          COMMENT=$(echo "$COMMENT" | sed "s|COMMIT_URL_PLACEHOLDER|$COMMIT_URL|g")
-          COMMENT=$(echo "$COMMENT" | sed "s|ACTOR_PLACEHOLDER|${{ github.actor }}|g")
+          COMMENT='{"body":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"✅ Code deployed to QA","marks":[{"type":"strong"}]}]},{"type":"paragraph","content":[{"type":"text","text":"Commit: "},{"type":"text","text":"'"$SHORT_SHA"'","marks":[{"type":"link","attrs":{"href":"'"$COMMIT_URL"'"}}]}]},{"type":"paragraph","content":[{"type":"text","text":"Deployed by: '"$ACTOR"'"}]}]}}'
           
           curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -X POST \
